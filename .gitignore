@@ -215,3 +215,7 @@ tests/integration/api_compliance/outputs/
 
 # Agent-generated temp
 .agent_tmp/
+
+# Next.js frontend
+ui/node_modules/
+ui/.next/
