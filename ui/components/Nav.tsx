@@ -23,7 +23,7 @@ export default function Nav() {
             </svg>
           </div>
           <div>
-            <div className="brand-name">Pharos</div>
+            <div className="brand-name">SDLC</div>
             <div className="brand-sub">Automation</div>
           </div>
         </div>
@@ -46,7 +46,9 @@ export default function Nav() {
           <span className="status-dot" />
           Online
         </div>
-        <div className="user-avatar">NB</div>
+        <Link href="/login" className="user-avatar" style={{ textDecoration: 'none' }}>
+          NB
+        </Link>
       </div>
     </nav>
   );

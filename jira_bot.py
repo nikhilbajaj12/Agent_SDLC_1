@@ -1,13 +1,20 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
-import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 from dotenv import load_dotenv
+
+# Windows consoles / non-interactive threads often default stdout to cp1252,
+# which can't encode the box-drawing and arrow characters used in step logs below.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from jira_tool import JiraExecutor, JiraAction
 
@@ -15,21 +22,32 @@ load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────
 JIRA_JQL = os.getenv("JIRA_JQL", 'labels = "Agent-ready" AND status = "Ready for Agent"')
-TARGET_REPO = os.getenv("TARGET_REPO", "nikhilbajaj12/Lighthouse-Pharos")
-TARGET_BRANCH = os.getenv("TARGET_BRANCH", "dev")
+# Fallbacks only — callers (the /run page, the API) normally pass target_repo/target_branch
+# per run so this bot isn't locked to a single hardcoded repo.
+DEFAULT_TARGET_REPO = os.getenv("TARGET_REPO", "nikhilbajaj12/Lighthouse-Pharos")
+DEFAULT_TARGET_BRANCH = os.getenv("TARGET_BRANCH", "dev")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 AZURE_MODEL = f"azure/{os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4.1-mini')}"
 AZURE_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_URL = os.getenv("AZURE_OPENAI_ENDPOINT")
-MAX_AGENT_ITERATIONS = 5
 # Status names — matches your Jira workflow
 STATUS_FAILED = os.getenv("STATUS_FAILED", "Human In Loop")
 STATUS_DONE = os.getenv("STATUS_DONE", "Done")
-WORKSPACE_DIR = Path(tempfile.mkdtemp(prefix="jira_bot_"))
-REPO_DIR = WORKSPACE_DIR / TARGET_REPO.split("/")[-1]
 
-print(f"  Target repo: {TARGET_REPO} ({TARGET_BRANCH})")
-print(f"  Workspace:   {WORKSPACE_DIR}")
+OnStep = Callable[[str, str, Optional[str]], None]
+
+
+class PipelineHalt(Exception):
+    """Raised to stop the pipeline early with a final run status."""
+
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _noop_on_step(step: str, state: str, log: Optional[str] = None) -> None:
+    pass
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -37,7 +55,7 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, silent: bool = False) -> tu
     """Run a command, return (exit_code, stdout, stderr)."""
     if not silent:
         print(f"  $ {' '.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd or REPO_DIR)
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if r.stdout:
         print(r.stdout[:1500])
     if r.stderr:
@@ -65,8 +83,24 @@ def step(msg: str):
     print(f"{'─' * 60}")
 
 
-# ── Main ────────────────────────────────────────────────────────────
-def main():
+# ── Pipeline ────────────────────────────────────────────────────────
+def run_pipeline(
+    ticket_key: Optional[str] = None,
+    on_step: OnStep = _noop_on_step,
+    target_repo: Optional[str] = None,
+    target_branch: Optional[str] = None,
+) -> dict:
+    """Runs the 6-stage Jira -> PR pipeline for one ticket.
+
+    ticket_key: if given, targets that specific ticket via JQL `key = "..."`.
+    Otherwise picks up the next ticket matching JIRA_JQL.
+    target_repo / target_branch: "owner/repo" and branch to clone + PR against.
+    Falls back to TARGET_REPO / TARGET_BRANCH env vars if not given.
+    Returns {status: "success", ticket_key, pr_url, modified_files} on success.
+    Raises PipelineHalt(status, message) on any early stop ("failed" or "human").
+    """
+    workspace_dir = Path(tempfile.mkdtemp(prefix="jira_bot_"))
+
     required = {
         "AZURE_OPENAI_API_KEY": AZURE_KEY,
         "AZURE_OPENAI_ENDPOINT": AZURE_URL,
@@ -78,32 +112,34 @@ def main():
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        print(f"!! Missing env vars: {', '.join(missing)}")
-        sys.exit(1)
-
-    # ── STEP 1: FETCH ───────────────────────────────────────────────
-    step("1/6  FETCH — Searching for ticket")
+        raise PipelineHalt("failed", f"Missing env vars: {', '.join(missing)}")
 
     jira = JiraExecutor()
-    result = jira(JiraAction(command="get_ticket", jql_filter=JIRA_JQL))
+
+    # ── STEP 1: FETCH ───────────────────────────────────────────────
+    on_step("fetch", "in-progress")
+    step("1/6  FETCH — Searching for ticket")
+
+    jql = f'key = "{ticket_key}"' if ticket_key else JIRA_JQL
+    result = jira(JiraAction(command="get_ticket", jql_filter=jql))
 
     if result.is_error or not result.text.strip() or result.text.startswith("No tickets found"):
-        print(f"  No ticket found matching: {JIRA_JQL}")
-        sys.exit(0)
+        msg = f"No ticket found matching: {jql}"
+        on_step("fetch", "failed", msg)
+        raise PipelineHalt("failed", msg)
 
-    # Parse the fetched result
     lines = result.text.strip().split("\n")
-    ticket_key = result.result
+    resolved_key = result.result
     summary = ""
     description = ""
-    status = ""
+    status_name = ""
     in_desc = False
     desc_lines: list[str] = []
     for line in lines:
         if line.startswith("Summary:"):
             summary = line.split(":", 1)[1].strip()
         elif line.startswith("Status:"):
-            status = line.split(":", 1)[1].strip()
+            status_name = line.split(":", 1)[1].strip()
         elif line.startswith("Description:"):
             in_desc = True
             desc_lines.append(line.split(":", 1)[1].strip())
@@ -111,22 +147,42 @@ def main():
             desc_lines.append(line.strip())
     description = "\n".join(desc_lines)
 
-    print(f"  Ticket: {ticket_key}")
+    # The ticket itself can name its target repo/branch, e.g.:
+    #   Repo: owner/repo
+    #   Branch: main
+    # Falls back to explicit run_pipeline args, then TARGET_REPO/TARGET_BRANCH env vars.
+    repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*:\s*(\S+)\s*$", description)
+    branch_match = re.search(r"(?im)^\s*branch\s*:\s*(\S+)\s*$", description)
+    if repo_match:
+        target_repo = repo_match.group(1)
+    if branch_match:
+        target_branch = branch_match.group(1)
+    target_repo = target_repo or DEFAULT_TARGET_REPO
+    target_branch = target_branch or DEFAULT_TARGET_BRANCH
+    # Strip those lines from the working description so they don't confuse the gate/agent prompts.
+    description = re.sub(r"(?im)^\s*(repo(?:sitory)?|branch)\s*:\s*\S+\s*$", "", description).strip()
+
+    repo_dir = workspace_dir / target_repo.split("/")[-1]
+    print(f"  Target repo: {target_repo} ({target_branch})")
+
+    print(f"  Ticket: {resolved_key}")
     print(f"  Summary: {summary}")
-    print(f"  Status: {status}")
+    print(f"  Status: {status_name}")
+    on_step("fetch", "success", f"{resolved_key}: {summary}")
 
     # ── STEP 2: CLARITY GATE ───────────────────────────────────────
+    on_step("gate", "in-progress")
     step("2/6  CLARITY GATE — Checking ticket detail")
 
     word_count = len(description.split())
     if word_count < 5:
         msg = f"Ticket description is too short ({word_count} words). Please provide more detail including specific packages, versions, and repository to modify."
         print(f"  !! {msg}")
-        jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=msg))
-        jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-        sys.exit(0)
+        on_step("gate", "failed", msg)
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+        jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+        raise PipelineHalt("human", msg)
 
-    # Quick LLM validation
     from openhands.sdk import LLM
     from openhands.sdk.llm import Message, TextContent
     from pydantic import SecretStr
@@ -139,7 +195,7 @@ def main():
 
     gate_prompt = (
         "You are validating a Jira ticket for an automation bot. "
-        f"The bot will work in repo {TARGET_REPO} on branch '{TARGET_BRANCH}'.\n\n"
+        f"The bot will work in repo {target_repo} on branch '{target_branch}'.\n\n"
         "Does the following description have enough detail about WHAT to change "
         "(specific packages, versions, files) to implement without guessing?\n"
         "Ignore missing repo/branch/location details — those are handled by the bot configuration.\n\n"
@@ -158,48 +214,50 @@ def main():
     except Exception as e:
         print(f"  !!! Gate LLM call failed: {e}")
         jira(JiraAction(
-            command="add_comment", ticket_key=ticket_key,
+            command="add_comment", ticket_key=resolved_key,
             comment_text="Clarity check failed to run (technical error) — please retry or check the bot logs",
         ))
-        jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-        sys.exit(0)
+        jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+        msg = f"Clarity check failed to run (technical error): {e}"
+        on_step("gate", "failed", msg)
+        raise PipelineHalt("failed", msg)
 
     gate_ok = gate_text.strip().upper().startswith("YES")
     print(f"  Gate response: {gate_text.strip()[:200]}")
     print(f"  → {'[OK] PASS' if gate_ok else '!! FAIL'}")
 
     if not gate_ok:
-        jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=f"Ticket needs more detail: {gate_text.strip()}"))
-        jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-        sys.exit(0)
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=f"Ticket needs more detail: {gate_text.strip()}"))
+        jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+        on_step("gate", "failed", gate_text.strip()[:200])
+        raise PipelineHalt("human", gate_text.strip())
+
+    on_step("gate", "success", gate_text.strip()[:200])
 
     # ── STEP 3: AGENT RUN ─────────────────────────────────────────
+    on_step("agent", "in-progress")
     step("3/6  AGENT RUN — Cloning repo and running agent")
 
-    repo_url = f"https://{GITHUB_TOKEN}@github.com/{TARGET_REPO}.git"
-
-    if REPO_DIR.exists():
-        run_cmd(["git", "fetch", "origin"], REPO_DIR)
-        run_cmd(["git", "checkout", TARGET_BRANCH], REPO_DIR)
-        run_cmd(["git", "pull", "origin", TARGET_BRANCH], REPO_DIR)
-    else:
-        print(f"  Git clone URL: https://<token>@github.com/{TARGET_REPO}.git")
-        rc, out, err = run_cmd(
-            ["git", "clone", "--branch", TARGET_BRANCH, repo_url, str(REPO_DIR)],
-            cwd=WORKSPACE_DIR,
-            silent=True,
-        )
-        if rc != 0:
-            print(f"!! Clone failed: {err}")
-            jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=f"Failed to clone repo: {err[:300]}"))
-            sys.exit(1)
+    repo_url = f"https://{GITHUB_TOKEN}@github.com/{target_repo}.git"
+    print(f"  Git clone URL: https://<token>@github.com/{target_repo}.git")
+    rc, out, err = run_cmd(
+        ["git", "clone", "--branch", target_branch, repo_url, str(repo_dir)],
+        cwd=workspace_dir,
+        silent=True,
+    )
+    if rc != 0:
+        msg = f"Failed to clone repo: {err[:300]}"
+        print(f"!! {msg}")
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+        on_step("agent", "failed", msg)
+        raise PipelineHalt("failed", msg)
 
     # Build task from ticket
     task_prompt = (
-        f"Jira Ticket {ticket_key}: {summary}\n\n"
+        f"Jira Ticket {resolved_key}: {summary}\n\n"
         f"Description: {description}\n\n"
-        f"You are working in repo: {TARGET_REPO} (branch: {TARGET_BRANCH})\n"
-        f"The workspace is at: {REPO_DIR}\n\n"
+        f"You are working in repo: {target_repo} (branch: {target_branch})\n"
+        f"The workspace is at: {repo_dir}\n\n"
         "CRITICAL: Do NOT ask me clarifying questions — just use your best judgment to interpret packages.\n"
         "Correct likely typos (e.g. 'pydentic' -> 'pydantic', 'trasformers' -> 'transformers', 'langraph' -> 'langgraph').\n"
         "IMPORTANT: Do NOT run 'pip install' or any package installation — it is too slow and unnecessary.\n"
@@ -228,12 +286,11 @@ def main():
 
     conversation = Conversation(
         agent=agent,
-        workspace=str(REPO_DIR),
+        workspace=str(repo_dir),
     )
 
-    print(f"  Agent workspace: {REPO_DIR}")
+    print(f"  Agent workspace: {repo_dir}")
     print(f"  Task: {task_prompt[:200]}...")
-    # Export env for git operations inside agent
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
 
     try:
@@ -241,23 +298,25 @@ def main():
         conversation.run()
         print("  [OK] Agent run completed")
     except Exception as e:
-        print(f"  !! Agent run failed: {e}")
-        jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=f"Agent run failed: {str(e)[:300]}"))
-        jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-        sys.exit(1)
+        msg = f"Agent run failed: {str(e)[:300]}"
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+        jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+        on_step("agent", "failed", msg)
+        raise PipelineHalt("human", msg)
 
     # ── STEP 4: VERIFY SUCCESS ─────────────────────────────────────
     step("4/6  VERIFY — Checking agent's work")
 
-    # Check if requirements.txt was modified
-    rc, stdout, _ = run_cmd(["git", "diff", "--name-only"], REPO_DIR)
+    rc, stdout, _ = run_cmd(["git", "diff", "--name-only"], repo_dir)
     modified_files = [f for f in stdout.strip().split("\n") if f.strip()]
 
     if not modified_files:
-        print("  !! No files were modified by the agent")
-        jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text="Agent made no changes to the repository."))
-        jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-        sys.exit(0)
+        msg = "Agent made no changes to the repository."
+        print(f"  !! {msg}")
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+        jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+        on_step("agent", "failed", msg)
+        raise PipelineHalt("human", msg)
 
     print(f"  [OK] Modified files: {modified_files}")
 
@@ -269,51 +328,59 @@ def main():
         for pkg_spec in new_packages:
             rc2, out2, err2 = run_cmd(
                 [sys.executable, "-m", "pip", "install", pkg_spec, "--dry-run"],
-                cwd=REPO_DIR,
+                cwd=repo_dir,
             )
             if rc2 != 0:
                 failed.append(pkg_spec)
         if failed:
-            print(f"  !! New packages failed pip check: {failed}")
-            jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=f"Agent modified requirements.txt but some new packages failed pip validation: {', '.join(failed)}"))
-            jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_FAILED))
-            sys.exit(0)
+            msg = f"Agent modified requirements.txt but some new packages failed pip validation: {', '.join(failed)}"
+            print(f"  !! {msg}")
+            jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+            jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_FAILED))
+            on_step("agent", "failed", msg)
+            raise PipelineHalt("human", msg)
 
     print("  [OK] Work verified successfully")
+    on_step("agent", "success", f"Modified: {', '.join(modified_files)}")
 
     # ── STEP 5: PR CREATION ─────────────────────────────────────────
+    on_step("pr", "in-progress")
     step("5/6  PR — Creating branch, committing, and opening PR")
 
     short_desc = summary.lower().replace(" ", "-").replace(".", "")[:40]
-    branch_name = f"feat/{ticket_key}-{short_desc}"
+    # Unique per run so re-running the same ticket never collides with a branch
+    # (and PR) an earlier run already pushed.
+    branch_name = f"feat/{resolved_key}-{short_desc}-{uuid.uuid4().hex[:6]}"
 
-    run_cmd(["git", "checkout", "-b", branch_name], REPO_DIR)
-    run_cmd(["git", "add", "-A"], REPO_DIR)
+    run_cmd(["git", "checkout", "-b", branch_name], repo_dir)
+    run_cmd(["git", "add", "-A"], repo_dir)
     rc, _, _ = run_cmd(
-        ["git", "commit", "-m", f"{ticket_key}: {summary}\n\nCloses {ticket_key}\n\nCo-authored-by: openhands <openhands@all-hands.dev>"],
-        REPO_DIR,
+        ["git", "commit", "-m", f"{resolved_key}: {summary}\n\nCloses {resolved_key}\n\nCo-authored-by: openhands <openhands@all-hands.dev>"],
+        repo_dir,
     )
     if rc != 0:
-        print("  ⚠️  Nothing to commit (already up to date)")
-        sys.exit(0)
+        msg = "Nothing to commit (already up to date)"
+        print(f"  ⚠️  {msg}")
+        on_step("pr", "failed", msg)
+        raise PipelineHalt("human", msg)
 
-    # Push
-    push_url = f"https://{GITHUB_TOKEN}@github.com/{TARGET_REPO}.git"
-    print(f"  Git push to: https://<token>@github.com/{TARGET_REPO}.git {branch_name}")
-    rc, out, err = run_cmd(["git", "push", push_url, branch_name], REPO_DIR)
+    push_url = f"https://{GITHUB_TOKEN}@github.com/{target_repo}.git"
+    print(f"  Git push to: https://<token>@github.com/{target_repo}.git {branch_name}")
+    rc, out, err = run_cmd(["git", "push", push_url, branch_name], repo_dir)
     if rc != 0:
-        print(f"  !! Push failed: {err[:300]}")
-        jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=f"Git push failed: {err[:300]}"))
-        sys.exit(1)
+        msg = f"Push failed: {err[:300]}"
+        print(f"  !! {msg}")
+        jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=msg))
+        on_step("pr", "failed", msg)
+        raise PipelineHalt("failed", msg)
 
     print(f"  [OK] Pushed branch: {branch_name}")
 
-    # Open PR
-    pr_title = f"{ticket_key}: {summary}"
+    pr_title = f"{resolved_key}: {summary}"
     pr_body = (
         f"## Summary\n"
-        f"Implements changes for Jira ticket **{ticket_key}**.\n\n"
-        f"**Ticket**: [{ticket_key}]({os.getenv('JIRA_BASE_URL')}/browse/{ticket_key})\n\n"
+        f"Implements changes for Jira ticket **{resolved_key}**.\n\n"
+        f"**Ticket**: [{resolved_key}]({os.getenv('JIRA_BASE_URL')}/browse/{resolved_key})\n\n"
         f"**Changes**:\n"
         f"- Modified files: {', '.join(modified_files)}\n\n"
         f"**Verification**:\n"
@@ -321,16 +388,18 @@ def main():
         f"- Ready for human review.\n"
     )
 
-    pr_data = gh_api("POST", f"/repos/{TARGET_REPO}/pulls", {
+    pr_data = gh_api("POST", f"/repos/{target_repo}/pulls", {
         "title": pr_title,
         "head": branch_name,
-        "base": TARGET_BRANCH,
+        "base": target_branch,
         "body": pr_body,
     })
     pr_url = pr_data.get("html_url", "")
     print(f"  [OK] PR created: {pr_url}")
+    on_step("pr", "success", pr_url)
 
     # ── STEP 6: REPORT BACK ───────────────────────────────────────
+    on_step("jira", "in-progress")
     step("6/6  REPORT — Updating Jira ticket")
 
     comment = (
@@ -340,13 +409,24 @@ def main():
         f"Tests verified: [OK]"
     )
 
-    jira(JiraAction(command="add_comment", ticket_key=ticket_key, comment_text=comment))
-    jira(JiraAction(command="update_status", ticket_key=ticket_key, target_status=STATUS_DONE))
+    jira(JiraAction(command="add_comment", ticket_key=resolved_key, comment_text=comment))
+    jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_DONE))
+    on_step("jira", "success", f"{resolved_key} -> {STATUS_DONE}")
 
     print(f"\n{'=' * 60}")
-    print(f"  [OK] DONE — {ticket_key} is now {STATUS_DONE}")
+    print(f"  [OK] DONE — {resolved_key} is now {STATUS_DONE}")
     print(f"  PR: {pr_url}")
     print(f"{'=' * 60}")
+
+    return {"status": "success", "ticket_key": resolved_key, "pr_url": pr_url, "modified_files": modified_files}
+
+
+def main():
+    try:
+        run_pipeline()
+    except PipelineHalt as e:
+        print(f"  !! {e.status.upper()}: {e.message}")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

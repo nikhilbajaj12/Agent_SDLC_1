@@ -38,7 +38,7 @@ export default function RunPage() {
         setPrUrl(r.pr_url);
         setDuration(r.duration_sec);
 
-        if (['success', 'failed', 'human'].includes(r.status)) {
+        if (['success', 'failed', 'error', 'human'].includes(r.status)) {
           if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
           setRunning(false);
         }
@@ -67,7 +67,7 @@ export default function RunPage() {
     }
   };
 
-  const isTerminal = status && ['success', 'failed', 'human'].includes(status);
+  const isTerminal = status && ['success', 'failed', 'error', 'human'].includes(status);
 
   return (
     <div className="bg-bg min-h-screen">
@@ -141,7 +141,7 @@ export default function RunPage() {
                     </p>
                   </div>
                 )}
-                {status === 'failed' && (
+                {(status === 'failed' || status === 'error') && (
                   <p style={{ color: 'var(--color-red)', fontSize: 14 }}>
                     Pipeline failed. Check logs for details.
                   </p>
