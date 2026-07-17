@@ -8,6 +8,8 @@ import { runTicket, getRunStatus, formatDuration, type RunRecord, type StepInfo 
 
 const STEPS: StepInfo[] = [
   { key: 'fetch', label: 'Fetching ticket', state: 'pending' },
+  { key: 'assign', label: 'Assigning to agent', state: 'pending' },
+  { key: 'in_progress', label: 'Moving to In Progress', state: 'pending' },
   { key: 'gate', label: 'Clarity gate', state: 'pending' },
   { key: 'agent', label: 'Agent coding & testing', state: 'pending' },
   { key: 'pr', label: 'Opening PR', state: 'pending' },
@@ -19,7 +21,7 @@ export default function RunPage() {
   const [runId, setRunId] = useState<string | null>(null);
   const [status, setStatus] = useState<RunRecord['status'] | null>(null);
   const [stepStates, setStepStates] = useState<Array<'pending' | 'in-progress' | 'success' | 'failed' | 'error' | 'human'>>(
-    ['pending', 'pending', 'pending', 'pending', 'pending']
+    STEPS.map(() => 'pending')
   );
   const [logs, setLogs] = useState<Record<string, string[]>>({});
   const [prUrl, setPrUrl] = useState<string | null>(null);
@@ -53,7 +55,7 @@ export default function RunPage() {
   const handleRun = async () => {
     if (!ticketKey.trim()) return;
     setError(null); setRunId(null); setStatus(null);
-    setStepStates(['pending', 'pending', 'pending', 'pending', 'pending']);
+    setStepStates(STEPS.map(() => 'pending'));
     setLogs({}); setPrUrl(null); setDuration(null);
     setRunning(true);
 

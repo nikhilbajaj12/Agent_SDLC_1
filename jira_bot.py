@@ -33,6 +33,7 @@ AZURE_URL = os.getenv("AZURE_OPENAI_ENDPOINT")
 # Status names — matches your Jira workflow
 STATUS_FAILED = os.getenv("STATUS_FAILED", "Human In Loop")
 STATUS_DONE = os.getenv("STATUS_DONE", "Done")
+STATUS_IN_PROGRESS = os.getenv("STATUS_IN_PROGRESS", "In Progress")
 
 OnStep = Callable[[str, str, Optional[str]], None]
 
@@ -118,7 +119,7 @@ def run_pipeline(
 
     # ── STEP 1: FETCH ───────────────────────────────────────────────
     on_step("fetch", "in-progress")
-    step("1/6  FETCH — Searching for ticket")
+    step("1/8  FETCH — Searching for ticket")
 
     jql = f'key = "{ticket_key}"' if ticket_key else JIRA_JQL
     result = jira(JiraAction(command="get_ticket", jql_filter=jql))
@@ -170,9 +171,33 @@ def run_pipeline(
     print(f"  Status: {status_name}")
     on_step("fetch", "success", f"{resolved_key}: {summary}")
 
-    # ── STEP 2: CLARITY GATE ───────────────────────────────────────
+    # ── STEP 2: ASSIGN — hand the ticket to the bot account ────────
+    on_step("assign", "in-progress")
+    step("2/8  ASSIGN — Assigning ticket to bot")
+
+    assign_result = jira(JiraAction(command="assign_to_self", ticket_key=resolved_key))
+    if assign_result.is_error:
+        print(f"  !! {assign_result.text}")
+        on_step("assign", "failed", assign_result.text)
+    else:
+        print(f"  [OK] {assign_result.text}")
+        on_step("assign", "success", assign_result.text)
+
+    # ── STEP 3: IN PROGRESS — move ticket out of the backlog ──────
+    on_step("in_progress", "in-progress")
+    step("3/8  IN PROGRESS — Moving ticket to in-progress")
+
+    ip_result = jira(JiraAction(command="update_status", ticket_key=resolved_key, target_status=STATUS_IN_PROGRESS))
+    if ip_result.is_error:
+        print(f"  !! {ip_result.text}")
+        on_step("in_progress", "failed", ip_result.text)
+    else:
+        print(f"  [OK] {ip_result.text}")
+        on_step("in_progress", "success", ip_result.text)
+
+    # ── STEP 4: CLARITY GATE ───────────────────────────────────────
     on_step("gate", "in-progress")
-    step("2/6  CLARITY GATE — Checking ticket detail")
+    step("4/8  CLARITY GATE — Checking ticket detail")
 
     word_count = len(description.split())
     if word_count < 5:
@@ -236,7 +261,7 @@ def run_pipeline(
 
     # ── STEP 3: AGENT RUN ─────────────────────────────────────────
     on_step("agent", "in-progress")
-    step("3/6  AGENT RUN — Cloning repo and running agent")
+    step("5/8  AGENT RUN — Cloning repo and running agent")
 
     repo_url = f"https://{GITHUB_TOKEN}@github.com/{target_repo}.git"
     print(f"  Git clone URL: https://<token>@github.com/{target_repo}.git")
@@ -305,7 +330,7 @@ def run_pipeline(
         raise PipelineHalt("human", msg)
 
     # ── STEP 4: VERIFY SUCCESS ─────────────────────────────────────
-    step("4/6  VERIFY — Checking agent's work")
+    step("6/8  VERIFY — Checking agent's work")
 
     rc, stdout, _ = run_cmd(["git", "diff", "--name-only"], repo_dir)
     modified_files = [f for f in stdout.strip().split("\n") if f.strip()]
@@ -345,7 +370,7 @@ def run_pipeline(
 
     # ── STEP 5: PR CREATION ─────────────────────────────────────────
     on_step("pr", "in-progress")
-    step("5/6  PR — Creating branch, committing, and opening PR")
+    step("7/8  PR — Creating branch, committing, and opening PR")
 
     short_desc = summary.lower().replace(" ", "-").replace(".", "")[:40]
     # Unique per run so re-running the same ticket never collides with a branch
@@ -400,7 +425,7 @@ def run_pipeline(
 
     # ── STEP 6: REPORT BACK ───────────────────────────────────────
     on_step("jira", "in-progress")
-    step("6/6  REPORT — Updating Jira ticket")
+    step("8/8  REPORT — Updating Jira ticket")
 
     comment = (
         f"Agent completed work on this ticket.\n\n"

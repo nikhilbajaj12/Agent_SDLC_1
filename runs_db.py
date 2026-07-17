@@ -7,7 +7,7 @@ from typing import Optional
 DB_PATH = Path(__file__).parent / "runs.db"
 _lock = threading.Lock()
 
-STEP_KEYS = ["fetch", "gate", "agent", "pr", "jira"]
+STEP_KEYS = ["fetch", "assign", "in_progress", "gate", "agent", "pr", "jira"]
 
 
 def _get_conn() -> sqlite3.Connection:

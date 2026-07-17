@@ -21,7 +21,7 @@ ENV_VARS = {"JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"}
 
 
 class JiraAction(Action):
-    command: Literal["get_ticket", "add_comment", "update_status"] = Field(
+    command: Literal["get_ticket", "add_comment", "update_status", "assign_to_self"] = Field(
         description="The Jira command to execute."
     )
     jql_filter: str = Field(
@@ -89,6 +89,8 @@ class JiraExecutor(ToolExecutor[JiraAction, JiraObservation]):
             return self._add_comment(action)
         if action.command == "update_status":
             return self._update_status(action)
+        if action.command == "assign_to_self":
+            return self._assign_to_self(action)
         return JiraObservation.from_text(
             text=f"Unknown command: {action.command}",
             is_error=True,
@@ -195,17 +197,40 @@ class JiraExecutor(ToolExecutor[JiraAction, JiraObservation]):
                 command=action.command,
             )
 
+    def _assign_to_self(self, action: JiraAction) -> JiraObservation:
+        if not action.ticket_key:
+            return JiraObservation.from_text(
+                text="assign_to_self requires ticket_key.",
+                is_error=True,
+                command=action.command,
+            )
+        try:
+            me = self._jira.myself()
+            account_id = me["accountId"]
+            self._jira.assign_issue(action.ticket_key, account_id)
+            return JiraObservation.from_text(
+                text=f"{action.ticket_key} assigned to {me.get('displayName', account_id)}.",
+                command=action.command,
+            )
+        except Exception as e:
+            return JiraObservation.from_text(
+                text=f"Failed to assign {action.ticket_key}: {e}",
+                is_error=True,
+                command=action.command,
+            )
+
     def close(self):
         pass
 
 
 _JIRA_DESCRIPTION = """Jira integration tool for interacting with Jira issues.
 
-Supports three commands:
+Supports four commands:
 1. get_ticket — Search for tickets using JQL (e.g. 'status = "Agent-ready"').
    Returns key, summary, description, status, and priority.
 2. add_comment — Post a comment to a ticket.
 3. update_status — Transition a ticket to a new status (looks up transition ID by name).
+4. assign_to_self — Assign a ticket to the authenticated (bot) account.
 
 Authentication is via environment variables: JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN.
 """
